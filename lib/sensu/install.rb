@@ -1,7 +1,192 @@
 require "sensu/install/version"
+require "optparse"
 
 module Sensu
   module Install
-    # Your code goes here...
+    class << self
+      def cli_options(arguments=ARGV)
+        options = {
+          :verbose => false,
+          :plugins => [],
+          :extensions => [],
+          :clean => false,
+          :proxy => nil
+        }
+        optparse = OptionParser.new do |opts|
+          opts.on("-h", "--help", "Display this message") do
+            puts opts
+            exit
+          end
+          opts.on("-v", "--verbose", "Enable verbose logging") do
+            options[:verbose] = true
+          end
+          opts.on("-p", "--plugin PLUGIN", "Install a Sensu PLUGIN") do |plugin|
+            options[:plugins] << plugin
+          end
+          opts.on("-P", "--plugins PLUGIN[,PLUGIN]", "PLUGIN or comma-delimited list of Sensu plugins to install") do |plugins|
+            options[:plugins].concat(plugins.split(","))
+          end
+          opts.on("-e", "--extension EXTENSION", "Install a Sensu EXTENSION") do |extension|
+            options[:extensions] << extension
+          end
+          opts.on("-E", "--extensions EXTENSION[,EXT]", "EXTENSION or comma-delimited list of Sensu extensions to install") do |extensions|
+            options[:extensions].concat(extensions.split(","))
+          end
+          opts.on("-s", "--source SOURCE", "Install Sensu plugins and extensions from a custom SOURCE") do |source|
+            options[:source] = source
+          end
+          opts.on("-c", "--clean", "Clean up (remove) other installed versions of the plugin(s) and/or extension(s)") do
+            options[:clean] = true
+          end
+          opts.on("-x", "--proxy PROXY", "Install Sensu plugins and extensions via a PROXY URL") do |proxy|
+            options[:proxy] = proxy
+          end
+        end
+        optparse.parse!(arguments)
+        options
+      end
+
+      def log(message)
+        puts "[SENSU-INSTALL] #{message}"
+      end
+
+      def gem_installed?(raw_gem, options={})
+        log "determining if Sensu gem '#{raw_gem}' is already installed ..."
+        gem_name, gem_version = raw_gem.split(":")
+        gem_command = "gem list -i #{gem_name}"
+        gem_command << " --version '#{gem_version}'" if gem_version
+        log gem_command if options[:verbose]
+        if system(gem_command)
+          log "Sensu gem '#{gem_name}' has already been installed"
+          true
+        else
+          log "Sensu gem '#{gem_name}' has not been installed" if options[:verbose]
+          false
+        end
+      end
+
+      def install_gem(raw_gem, options={})
+        log "installing Sensu gem '#{raw_gem}'"
+        gem_name, gem_version = raw_gem.split(":")
+        gem_command = "gem install #{gem_name}"
+        gem_command << " --version '#{gem_version}'" if gem_version
+        gem_command << " --no-ri --no-rdoc"
+        gem_command << " --verbose" if options[:verbose]
+        gem_command << " --source #{options[:source]}" if options[:source]
+        gem_command << " --http-proxy #{options[:proxy]}" if options[:proxy]
+        log gem_command if options[:verbose]
+        unless system(gem_command)
+          log "failed to install Sensu gem '#{gem_name}'"
+          log "you can run the sensu-install command again with --verbose for more info" unless options[:verbose]
+          log "please take note of any failure messages above"
+          log "make sure you have build tools installed (e.g. gcc)"
+          log "trying to determine the Sensu plugin homepage for #{gem_name} ..."
+          system("gem specification #{gem_name} -r | grep homepage")
+          exit 2
+        end
+      end
+
+      def gem_installed_versions(raw_gem, options={})
+        gem_name, gem_version = raw_gem.split(":")
+        log "determining installed versions of Sensu gem '#{gem_name}' ..."
+        gem_command = "gem list #{gem_name}"
+        log gem_command if options[:verbose]
+        gem_command_output = `#{gem_command}`
+        last_line = gem_command_output.split("\n").last
+        if last_line == "false"
+          []
+        else
+          /\((.*)\)/.match(last_line)[1].split(", ")
+        end
+      end
+
+      def clean_gem(raw_gem, options={})
+        log "cleaning Sensu gem '#{raw_gem}'"
+        gem_name, gem_version = raw_gem.split(":")
+        gem_command = "gem clean #{gem_name}"
+        if gem_version
+          if gem_installed_versions(raw_gem, options) == [gem_version]
+            log "Sensu gem '#{gem_name}' version '#{gem_version}' is the only version installed"
+          else
+            gem_command = "gem uninstall #{gem_name} --version '!= #{gem_version}' -a"
+          end
+        end
+        log gem_command if options[:verbose]
+        if system(gem_command)
+          log "successfully cleaned Sensu gem '#{gem_name}'"
+        else
+          log "failed to clean Sensu gem '#{gem_name}'"
+        end
+      end
+
+      def install_plugins(plugins, options={})
+        log "installing Sensu plugins ..."
+        log "provided Sensu plugins: #{plugins}" if options[:verbose]
+        plugin_gems = plugins.map do |plugin|
+          if plugin.start_with?("sensu-plugins-")
+            plugin
+          else
+            "sensu-plugins-#{plugin}"
+          end
+        end
+        log "compiled Sensu plugin gems: #{plugin_gems}" if options[:verbose]
+        to_be_installed = plugin_gems.reject do |raw_gem|
+          gem_installed?(raw_gem, options)
+        end
+        log "Sensu plugin gems to be installed: #{to_be_installed}"
+        to_be_installed.each do |raw_gem|
+          install_gem(raw_gem, options)
+        end
+        log "successfully installed Sensu plugins: #{to_be_installed}"
+        if options[:clean]
+          log "cleaning Sensu plugin gems: #{plugin_gems}" if options[:verbose]
+          plugin_gems.each do |raw_gem|
+            clean_gem(raw_gem, options)
+          end
+        end
+      end
+
+      def install_extensions(extensions, options={})
+        if ENV["EMBEDDED_RUBY"] == "false"
+          log "EMBEDDED_RUBY must be set to true in order to install extensions"
+          log "failed to install extensions: #{extensions}"
+          exit 2
+        end
+        log "installing Sensu extensions ..."
+        log "provided Sensu extensions: #{extensions}" if options[:verbose]
+        extension_gems = extensions.map do |extension|
+          if extension.start_with?("sensu-extensions-")
+            extension
+          else
+            "sensu-extensions-#{extension}"
+          end
+        end
+        log "compiled Sensu extension gems: #{extension_gems}" if options[:verbose]
+        to_be_installed = extension_gems.reject do |raw_gem|
+          gem_installed?(raw_gem, options)
+        end
+        log "Sensu extension gems to be installed: #{to_be_installed}"
+        to_be_installed.each do |raw_gem|
+          install_gem(raw_gem, options)
+        end
+        log "successfully installed Sensu extensions: #{to_be_installed}"
+        if options[:clean]
+          log "cleaning Sensu extension gems: #{extension_gems}" if options[:verbose]
+          extension_gems.each do |raw_gem|
+            clean_gem(raw_gem, options)
+          end
+        end
+      end
+
+      def run
+        options = cli_options
+        unless options[:plugins].empty?
+          install_plugins(options[:plugins], options)
+        end
+        unless options[:extensions].empty?
+          install_extensions(options[:extensions], options)
+        end
+      end
+    end
   end
 end
